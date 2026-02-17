@@ -1,272 +1,230 @@
-#include <windows.h>
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
-#include <atomic>
-#include <algorithm>
-#include <locale>
-#include "Timer/Timer.h"
-#include <array>
+#include <iostream>
+#include <fstream>
 #include <thread>
+#include <future>
+#include <queue>
+#include <mutex>
+#include <chrono>
+#include <iomanip>
+#include <random>
 
+// Константы
+const unsigned char TARGET_BYTE1 = 0x0a;
+const unsigned char TARGET_BYTE2 = 0x0d;
+const unsigned char TARGET_BYTE3 = 0x20;
+const char* FILENAME = "input.bin";
+const size_t FILE_SIZE = 30 * 1024 * 1024;  // 30 МБ
 
-// Структура для передачи параметров в потоки
-typedef struct {
-    const char* filename;
-    std::atomic<ULONGLONG>* counts; // атомарные счетчики для каждого символа
-    int threadId;
-} ThreadParams;
+// Общая очередь
+std::queue<unsigned char> byte_queue;
+std::mutex queue_mtx;
 
+// Структура результатов
+struct CountResult {
+    int count_0a;
+    int count_0d;
+    int count_20;
+    int count_group;
+    size_t queue_size;
+};
 
+// Генерация тестового файла
+void generate_test_file(const std::string& filename, size_t size_bytes) {
+    std::cout << "Генерация файла " << filename
+              << " размером " << (size_bytes / 1024.0 / 1024.0) << " МБ...\n";
 
-BOOL CreateFileThread(ThreadParams& param) {
-    std::string function_name = "CreateFileThread";
-
-    Timer timer(function_name);
-
-    printf("Поток создания файла запущен...\n");
-
-    std::array<unsigned char, 5> symbols{0x0A, 0x0D, 0x0B, 0x20, 0x22};
-    const DWORD symbolCount = sizeof(symbols) / sizeof(symbols[0]);
-
-    const ULONGLONG targetSize = 120ULL * 1024ULL * 1024ULL;
-
-    HANDLE hFile = CreateFileA(
-            param.filename,
-            GENERIC_WRITE | GENERIC_READ,
-            FILE_SHARE_READ,
-            nullptr,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-
-    if (hFile == INVALID_HANDLE_VALUE) {
-        printf("Create file error: %lu\n", GetLastError());
-        return FALSE;
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Ошибка создания файла\n";
+        return;
     }
 
-    LARGE_INTEGER fileSize, zeroOffset;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<unsigned char> dist(0, 255);
 
-    fileSize.QuadPart = targetSize;
+    const size_t BUFFER_SIZE = 1024 * 1024;
+    std::vector<unsigned char> buffer(BUFFER_SIZE);
 
-    if (!SetFilePointerEx(hFile, fileSize, nullptr, FILE_BEGIN)) {
-        printf("SetFilePointerEx error: %lu\n", GetLastError());
-        CloseHandle(hFile);
-        return FALSE;
-    }
+    size_t bytes_written = 0;
+    while (bytes_written < size_bytes) {
+        size_t chunk_size = std::min(BUFFER_SIZE, size_bytes - bytes_written);
 
-    if (!SetEndOfFile(hFile)) { // Устанавливает конец файла в текущую позицию указателя.
-        printf("SetEndOfFile error: %lu\n", GetLastError());
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    zeroOffset.QuadPart = 0;
-    if (!SetFilePointerEx(hFile, zeroOffset, nullptr, FILE_BEGIN)) {
-        printf("SetFilePointerEx error: %lu\n", GetLastError());
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    HANDLE hMap = CreateFileMappingA(
-            hFile,
-            NULL,
-            PAGE_READWRITE,
-            fileSize.HighPart,
-            fileSize.LowPart,
-            NULL);
-
-    if (hMap == NULL) {
-        printf("Mapping file error: 123 %lu\n", GetLastError());
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    LPVOID fileData = MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, 0);
-    if (fileData == nullptr) {
-        printf("CreateFileMapping error: %lu\n", GetLastError());
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    auto *data = static_cast<unsigned char *>(fileData);
-
-    for (ULONGLONG i = 0; i < targetSize; i++) {
-        data[i] = symbols[i % symbolCount];
-    }
-
-    if (!FlushViewOfFile(fileData, 0)) {
-        printf("FlushViewOfFile error: %lu\n", GetLastError());
-    }
-
-    UnmapViewOfFile(fileData);
-    CloseHandle(hMap);
-    CloseHandle(hFile);
-
-    return TRUE;
-}
-
-BOOL CountSymbolsInFile(ThreadParams& param) {
-    std::string function_name = "CountSymbolsInFile";
-    Timer timer(function_name);
-
-    HANDLE hFile = CreateFileA(
-            param.filename,
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-
-    if (hFile == INVALID_HANDLE_VALUE) {
-        printf("Read file error: %lu\n", GetLastError());
-    }
-
-    LARGE_INTEGER fileSize;
-    if(!GetFileSizeEx(hFile, &fileSize)) {
-        std::cerr << "Error getting file size" << std::endl;
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    HANDLE hMap = CreateFileMappingA(
-            hFile,
-            nullptr,
-            PAGE_READONLY,
-            fileSize.HighPart,
-            fileSize.LowPart,
-            nullptr);
-
-    if (hMap == INVALID_HANDLE_VALUE) {
-        printf("Mapping file error  %lu\n", GetLastError());
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    auto* pData = static_cast<const UCHAR*>(
-            MapViewOfFile(
-                    hMap,
-                    FILE_MAP_READ,
-                    0, 0,
-                    fileSize.QuadPart
-
-            ));
-
-    if (pData == nullptr) {
-        printf("Mapping file error: %lu\n", GetLastError());
-        CloseHandle(hMap);
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    const ULONGLONG chunkSize = 10 * 1024 * 1024; // 10 МБ chunks
-    const ULONGLONG totalSize = fileSize.QuadPart;
-
-    for (ULONGLONG offset = 0; offset < totalSize; offset += chunkSize) {
-        ULONGLONG chunkEnd = std::min(offset + chunkSize, totalSize);
-
-        for (ULONGLONG i = offset; i < chunkEnd; i++) {
-            switch (pData[i]) {
-                case 0x0A: param.counts[0]++; break;
-                case 0x0D: param.counts[1]++; break;
-                case 0x0B: param.counts[2]++; break;
-                case 0x20: param.counts[3]++; break;
-                case 0x22: param.counts[4]++; break;
-            }
+        for (size_t i = 0; i < chunk_size; ++i) {
+            buffer[i] = dist(gen);
         }
 
-        //std::cout << "Processed: " << (chunkEnd / (1024 * 1024)) << " MB" << std::endl;
+        file.write(reinterpret_cast<char*>(buffer.data()), chunk_size);
+        bytes_written += chunk_size;
     }
 
-    UnmapViewOfFile(pData);
-    CloseHandle(hMap);
-    CloseHandle(hFile);
-
-    return TRUE;
+    file.close();
+    std::cout << "Файл создан успешно!\n\n";
 }
 
+// Функция обработки части файла (для packaged_task)
+CountResult process_file_chunk(const std::string& filename, size_t start_pos, size_t end_pos) {
+    CountResult result = {0, 0, 0, 0, 0};
 
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Ошибка открытия файла\n";
+        return result;
+    }
 
+    file.seekg(start_pos);
 
-// Функция для вывода результатов
-DWORD WINAPI OutputResultsThread(LPVOID param) {
+    unsigned char prev_byte = 0;
+    char byte;
+    size_t current_pos = start_pos;
 
-    auto* p = static_cast<ThreadParams*>(param);
+    while (file.get(byte) && current_pos < end_pos) {
+        unsigned char ub = static_cast<unsigned char>(byte);
 
-    // Ждем завершения подсчета символов
-    Sleep(1000); // Небольшая задержка для демонстрации
+        if (ub == TARGET_BYTE1) {
+            result.count_0a++;
+            std::lock_guard<std::mutex> lock(queue_mtx);
+            byte_queue.push(ub);
+        }
+        else if (ub == TARGET_BYTE2) {
+            result.count_0d++;
+            std::lock_guard<std::mutex> lock(queue_mtx);
+            byte_queue.push(ub);
+        }
+        else if (ub == TARGET_BYTE3) {
+            result.count_20++;
+            std::lock_guard<std::mutex> lock(queue_mtx);
+            byte_queue.push(ub);
+        }
 
-    printf("\n=== РЕЗУЛЬТАТЫ ПОДСЧЕТА СИМВОЛОВ ===\n");
-    printf("Символ 0x0A (LF):  %llu\n", p->counts[0].load());
-    printf("Символ 0x0D (CR):  %llu\n", p->counts[1].load());
-    printf("Символ 0x0B (VT):  %llu\n", p->counts[2].load());
-    printf("Символ 0x20 (SP):  %llu\n", p->counts[3].load());
-    printf("Символ 0x22 (\");  %llu\n", p->counts[4].load());
+        // Проверка группы 0x0d0a
+        if (ub == 0x0a && prev_byte == 0x0d) {
+            result.count_group++;
+        }
 
-    ULONGLONG total = p->counts[0] + p->counts[1] + p->counts[2] + p->counts[3] + p->counts[4];
-    printf("Общее количество символов: %llu\n", total);
-    printf("Ожидаемый размер файла: 125829120 байт (120 МБ)\n");
+        prev_byte = ub;
+        current_pos++;
+    }
 
-    return 0;
+    file.close();
+
+    {
+        std::lock_guard<std::mutex> lock(queue_mtx);
+        result.queue_size = byte_queue.size();
+    }
+
+    return result;
 }
 
 int main() {
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-    const char* filename = "test_file.bin";
+    // Проверка/создание файла
+    std::ifstream check_file(FILENAME);
+    if (!check_file.good()) {
+        check_file.close();
+        generate_test_file(FILENAME, FILE_SIZE);
+    } else {
+        check_file.close();
+        std::cout << "Файл существует, используем его\n\n";
+    }
 
-    // Атомарные счетчики для каждого символа
-    std::atomic<ULONGLONG> counts[5] = {0, 0, 0, 0, 0};
+    // Временные метки начала
+    auto start_time = std::chrono::steady_clock::now();
+    auto start_timestamp = std::chrono::system_clock::now();
+    auto start_time_t = std::chrono::system_clock::to_time_t(start_timestamp);
 
-    // Параметры для потоков
-    ThreadParams createParams = {filename, counts, 1};
-    ThreadParams countParams = {filename, counts, 2};
-    //ThreadParams outputParams = {filename, counts, 3};
+    std::cout << "=== НАЧАЛО РАБОТЫ ПРОГРАММЫ ===\n";
+    std::cout << "Время начала: "
+              << std::put_time(std::localtime(&start_time_t), "%Y-%m-%d %H:%M:%S")
+              << std::endl;
 
-    HANDLE threads[3];
-    DWORD threadIDs[3];
+    // Определяем размер файла
+    std::ifstream size_file(FILENAME, std::ios::binary | std::ios::ate);
+    if (!size_file.is_open()) {
+        std::cerr << "Ошибка открытия файла\n";
+        return 1;
+    }
 
-    printf("=== ЗАПУСК ПРОГРАММЫ ===\n");
+    size_t file_size = size_file.tellg();
+    size_file.close();
 
-    // Создаем поток для создания файла
-    std::thread t(CreateFileThread, std::ref(createParams));
+    std::cout << "Размер файла: " << (file_size / 1024.0 / 1024.0)
+              << " МБ (" << file_size << " байт)\n";
 
-//    if (threads[0] == NULL) {
-//        printf("Ошибка создания потока для создания файла\n");
-//        return 1;
-//    }
-    t.join();
+    size_t mid_point = file_size / 2;
 
-    // Ждем завершения создания файла
-//    WaitForSingleObject(threads[0], INFINITE);
-//    CloseHandle(threads[0]);
+    // ===== КЛЮЧЕВАЯ ЧАСТЬ: std::packaged_task =====
 
-    std::thread t2(CountSymbolsInFile, std::ref(countParams));
-    t2.join();
-    // Создаем поток для подсчета символов
-//    threads[1] = CreateThread(NULL, 0, CountSymbolsThread, &countParams, 0, &threadIDs[1]);
-//    if (threads[1] == NULL) {
-//        printf("Ошибка создания потока для подсчета символов\n");
-//        return 1;
-//    }
-//
-//    // Создаем поток для вывода результатов
-//    threads[2] = CreateThread(NULL, 0, OutputResultsThread, &outputParams, 0, &threadIDs[2]);
-//    if (threads[2] == NULL) {
-//        printf("Ошибка создания потока для вывода результатов\n");
-//        CloseHandle(threads[1]);
-//        return 1;
-//    }
-//
-//    // Ждем завершения всех потоков
-//    WaitForMultipleObjects(2, &threads[1], TRUE, INFINITE);
-//
-//    CloseHandle(threads[1]);
-//    CloseHandle(threads[2]);
+    // Создаём packaged_task для каждой задачи
+    std::packaged_task<CountResult(const std::string&, size_t, size_t)> task1(process_file_chunk);
+    std::packaged_task<CountResult(const std::string&, size_t, size_t)> task2(process_file_chunk);
 
-    // Удаляем временный файл
-    //DeleteFileA(filename);
+    // Получаем future из packaged_task
+    std::future<CountResult> future1 = task1.get_future();
+    std::future<CountResult> future2 = task2.get_future();
+
+    // Запускаем потоки с packaged_task (через std::move, т.к. packaged_task не копируется)
+    std::cout << "Запуск обработки в 2 потока...\n";
+    std::thread thread1(std::move(task1), FILENAME, 0, mid_point);
+    std::thread thread2(std::move(task2), FILENAME, mid_point, file_size);
+
+    // Ждём завершения потоков
+    thread1.join();
+    thread2.join();
+
+    // Получаем результаты через future
+    CountResult result1 = future1.get();
+    CountResult result2 = future2.get();
+
+    // Суммируем результаты
+    int total_0a = result1.count_0a + result2.count_0a;
+    int total_0d = result1.count_0d + result2.count_0d;
+    int total_20 = result1.count_20 + result2.count_20;
+    int total_group = result1.count_group + result2.count_group;
+
+    // Временные метки окончания
+    auto end_time = std::chrono::steady_clock::now();
+    auto end_timestamp = std::chrono::system_clock::now();
+    auto end_time_t = std::chrono::system_clock::to_time_t(end_timestamp);
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+    std::cout << "\n=== РЕЗУЛЬТАТЫ РАБОТЫ ПРОГРАММЫ ===\n";
+    std::cout << "Время окончания: "
+              << std::put_time(std::localtime(&end_time_t), "%Y-%m-%d %H:%M:%S")
+              << std::endl;
+    std::cout << "Время выполнения: " << duration.count() << " мс\n";
+    std::cout << "Скорость обработки: "
+              << (file_size / 1024.0 / 1024.0) / (duration.count() / 1000.0)
+              << " МБ/с\n";
+
+    std::cout << "\n--- КОЛИЧЕСТВЕННЫЕ ПОКАЗАТЕЛИ ---\n";
+    std::cout << "Количество байт 0x0a (LF): " << total_0a << "\n";
+    std::cout << "Количество байт 0x0d (CR): " << total_0d << "\n";
+    std::cout << "Количество байт 0x20 (пробел): " << total_20 << "\n";
+    std::cout << "Количество групп 0x0d0a (CRLF): " << total_group << "\n";
+
+    {
+        std::lock_guard<std::mutex> lock(queue_mtx);
+        std::cout << "Размер очереди: " << byte_queue.size() << " элементов\n";
+    }
+
+    // Пояснения результатов
+    std::cout << "\n--- ПОЯСНЕНИЕ РЕЗУЛЬТАТОВ ---\n";
+    std::cout << "1. Файл обработан в 2 потока параллельно\n";
+    std::cout << "2. Байты 0x0a, 0x0d, 0x20 записаны в общую очередь\n";
+    std::cout << "3. Размер очереди = сумма найденных целевых байтов\n";
+    std::cout << "4. Группы 0x0d0a - последовательности CR+LF (перевод строки Windows)\n";
+    std::cout << "5. Для случайных данных ожидается ~117KB каждого байта (30MB/256≈117KB)\n";
+
+    // Проверка корректности
+    int expected_queue_size = total_0a + total_0d + total_20;
+    {
+        std::lock_guard<std::mutex> lock(queue_mtx);
+        if (byte_queue.size() == expected_queue_size) {
+            std::cout << "✓ Размер очереди совпадает с суммой найденных байтов\n";
+        } else {
+            std::cout << "✗ ОШИБКА: несоответствие размера очереди!\n";
+        }
+    }
 
     return 0;
 }
